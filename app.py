@@ -8,15 +8,17 @@ from pyzotero import zotero
 from collections import defaultdict
 from openai.embeddings_utils import get_embedding, cosine_similarity
 
+N_EMBED = 3
+
+
 # Set dataframe display options
 st.set_page_config(layout="wide")
 
 
+# @st.cache_data
 def get_zotero(zotero_user_id, zotero_key):
     """
-
-    :type zotero_user_id: str
-    :type zotero_key: str
+    Get PDF metadata from Zotero library
     """
     # Authenticate with Zotero API
     zot = zotero.Zotero(zotero_user_id, 'user', zotero_key)
@@ -41,18 +43,14 @@ def get_zotero(zotero_user_id, zotero_key):
 
     # Get items with PDFs
     pdf_items = [item for item in items if item['data'].get('contentType', '') == 'application/pdf']
-    # st.write(pdf_items)
-    # st.write(f"### Found {len(pdf_items)} PDFs")
     pdf_data = []
     for pdf_item in pdf_items:
-        pdf_metadata = pdf_item['data']
         parent_id = pdf_item['data'].get('parentItem')
         try:
             parent_item = next(item for item in items if item['data']['key'] == parent_id)
             parent_metadata = parent_item['data']
             pdf_data.append({
                 'title': parent_metadata.get('title', ''),
-                # 'date': parent_metadata.get('date', ''),
                 'type': parent_metadata.get('itemType', ''),
                 'publication': parent_metadata.get('publicationTitle', ''),
                 'doi': parent_metadata.get('DOI', ''),
@@ -65,12 +63,10 @@ def get_zotero(zotero_user_id, zotero_key):
     return pd.DataFrame(pdf_data)
 
 
+# @st.cache_data
 def extract_text_from_pdf(pdf_path, pdf_title):
     """
-    extract text from pdf
-    :param pdf_title:
-    :param pdf_path:
-    :return:
+    Extract text from PDF file
     """
     paper_dict = defaultdict(list)
     with open(pdf_path, "rb") as f:
@@ -81,66 +77,54 @@ def extract_text_from_pdf(pdf_path, pdf_title):
                 paper_dict['page'].append(page_num + 1)
                 paper_dict['text'].append(paragraph)
                 paper_dict['title'].append(pdf_title)
-        return pd.DataFrame(paper_dict)
+    return pd.DataFrame(paper_dict)
 
 
+# @st.cache_data
 def get_pdf_text(zotero_path, pdf_id, pdf_title):
     """
-
-    :param pdf_title:
-    :param zotero_path:
-    :param pdf_id:
-    :return:
+    Get text content from a PDF file
     """
     pdf_path = os.path.join(zotero_path, 'storage', pdf_id)
-    print(pdf_path)
     pdf_files = glob.glob(os.path.join(pdf_path, "*.pdf"))
     if len(pdf_files) > 0:
         return extract_text_from_pdf(pdf_files[0], pdf_title)
     else:
         st.warning(f"PDF not found for {pdf_id}")
-        return ''
+        return pd.DataFrame()
 
 
+# @st.cache_data
 def calculate_similarity(paper_df, query, n=3):
     """
-    calculate the similarity of query and paper text
-    :param paper_df:
-    :param query:
-    :param n:
-    :return:
+    Calculate the cosine similarity between the embeddings of the papers and the query
     """
     embedding_model = 'text-embedding-ada-002'
     paper_df['embeddings'] = paper_df.text.apply(lambda x: get_embedding(x, engine=embedding_model))
     query_embedding = get_embedding(query, engine=embedding_model)
-    # calculate cosine similarity
+    # Calculate cosine similarity
     paper_df['similarity'] = paper_df.embeddings.apply(lambda x: cosine_similarity(x, query_embedding))
     results = paper_df.sort_values("similarity", ascending=False, ignore_index=True)
     results = results.head(n)
-    # st.write(results)
     return results
 
-
-def paper_chat(paper_df, query):
+def paper_chat(paper_df, query, titles, n_paper):
     """
-
-    :param query:
-    :param paper_df:
-    :return:
+    Get a response from OpenAI GPT-3
     """
     chat_model = 'gpt-3.5-turbo'
-    results = calculate_similarity(paper_df, query, n=3)
+    results = calculate_similarity(paper_df, query, n=N_EMBED)
+    
+    embeddings = " ".join([f"{x}: {results.iloc[x]['text'][:500]}" for x in range(N_EMBED)])
+    paper_titles = ",".join(titles)
 
-    embeddings_1 = str(results.iloc[0]['text'][:500])
-    embeddings_2 = str(results.iloc[1]['text'][:500])
-    embeddings_3 = str(results.iloc[2]['text'][:500])
-
-    system_role = f"""Act as an academician whose expertise is reading and summarizing scientific papers. You are given a query, a series of text embeddings and the title from a paper in order of their cosine similarity to the query. You must take the given embeddings and return a very detailed summary of the paper in the language of the query. The embeddings are as follows: 1. {embeddings_1}. 2. {embeddings_2}. 3. {embeddings_3}. The title of the paper is: {paper_df.iloc[0].title}"""
+    system_role = f"""Act as an academician whose expertise is reading and summarizing scientific papers. You are given a query, a series of text embeddings and the title from {n_paper} papers in order of their cosine similarity to the query. You must take the given embeddings and return a very detailed summary of the papers in the language of the query. The embeddings are as follows: {embeddings}. The title of the papers are as follows: {paper_titles}"""
     user_content = f"""Given the question: "{str(query)}". Return a detailed answer based on the paper:"""
 
     messages = [
         {"role": "system", "content": system_role},
-        {"role": "user", "content": user_content}, ]
+        {"role": "user", "content": user_content},
+    ]
 
     response = openai.ChatCompletion.create(
         model=chat_model,
@@ -149,27 +133,47 @@ def paper_chat(paper_df, query):
         max_tokens=3000
     ).choices[0]["message"]["content"]
 
-    return {"embedding_1": embeddings_1, "embedding_2": embeddings_2, "embedding_3": embeddings_3, 'response': response}
+    return response
 
-
-# Get local zotero pdf path
-zotero_path = st.sidebar.text_input("Zotero Path", value='/Users/baoyi/Zotero')
+st.write("# PaperGPT")
+    
+# Get local Zotero PDF path
+zotero_path = st.sidebar.text_input("Zotero Path", value='/Users/XXX/Zotero')
 
 # Get Zotero API key and user ID
 zotero_user_id = st.sidebar.text_input("Zotero User ID", value='')
 zotero_key = st.sidebar.text_input("Zotero API Key", type="password", value='')
 
 # Get OpenAI API key
-openai_key = st.sidebar.text_input("OpenAI API Key", type="password",
-                                   value='')
-openai.api_key = openai_key
+openai_key = st.sidebar.text_input("OpenAI API Key", type="password", value='')
 
 if zotero_user_id and zotero_key and openai_key:
+    # Get PDF metadata from Zotero library
     df = get_zotero(zotero_user_id, zotero_key)
     st.dataframe(df, width=1200)
-
-    paper_df = get_pdf_text(zotero_path, df.iloc[4]['id'], df.iloc[4].title)
+    
+    # Get user query input
     input_query = st.text_input("Input query:")
-    st.write(paper_chat(paper_df, input_query))
+    
+    # add multiselect
+    if st.sidebar.checkbox('Enable multiple paper selection'):
+        paper_list = st.multiselect('Select paper id:', df.index.unique())
+
+    # Execute paper search and display results on button click
+    if st.button("Search"):
+        # Get text content from selected PDF
+        papers = []
+        titles = []
+        for paper in paper_list:
+            title = df.iloc[paper].title
+            papers.append(get_pdf_text(zotero_path, df.iloc[paper]['id'], title))
+            
+            titles.append(title)
+
+        paper_df = pd.concat(papers, ignore_index=True)
+         
+        with st.spinner("Searching..."):
+            response = paper_chat(paper_df, input_query, titles, len(papers))
+            st.text_area("Response:", value=response, height=500, max_chars=None)
 else:
     st.write("### Please enter your Zotero API key and user ID")
